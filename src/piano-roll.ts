@@ -2,7 +2,6 @@ import type WaveSurfer from 'wavesurfer.js'
 import { BasePlugin } from 'wavesurfer.js/dist/base-plugin.js'
 import { Midi } from '@tonejs/midi'
 import * as Tone from 'tone'
-import { Piano } from '@tonejs/piano'
 
 /** Available synth types for preview */
 export type PreviewSynthType = 'sine' | 'synth' | 'piano'
@@ -101,8 +100,7 @@ export default class PianoRollPlugin extends BasePlugin<PianoRollPluginEvents, P
     private currentSynthType: PreviewSynthType = 'synth'
     private sineSynth: Tone.PolySynth | null = null
     private triangleSynth: Tone.PolySynth | null = null
-    private pianoSynth: Piano | null = null
-    private pianoLoaded = false
+    private pianoSynth: Tone.PolySynth | null = null  // FM synth with piano-like sound
     private playingNotes: Set<string> = new Set() // Track which notes are currently sounding
 
     constructor(options: PianoRollPluginOptions = {}) {
@@ -321,14 +319,27 @@ export default class PianoRollPlugin extends BasePlugin<PianoRollPluginEvents, P
                 }
                 break
             case 'piano':
+                // Use FM synth for piano-like sound (no sample loading needed)
                 if (!this.pianoSynth) {
-                    this.pianoSynth = new Piano({
-                        velocities: 4,
+                    this.pianoSynth = new Tone.PolySynth(Tone.FMSynth, {
+                        harmonicity: 3,
+                        modulationIndex: 10,
+                        oscillator: { type: 'sine' },
+                        envelope: {
+                            attack: 0.001,
+                            decay: 0.4,
+                            sustain: 0.1,
+                            release: 1.2,
+                        },
+                        modulation: { type: 'square' },
+                        modulationEnvelope: {
+                            attack: 0.002,
+                            decay: 0.2,
+                            sustain: 0,
+                            release: 0.2,
+                        },
                     }).toDestination()
-                    this.pianoSynth.volume.value = -6
-                    // Load the piano samples
-                    await this.pianoSynth.load()
-                    this.pianoLoaded = true
+                    this.pianoSynth.volume.value = -8
                 }
                 break
         }
@@ -353,7 +364,6 @@ export default class PianoRollPlugin extends BasePlugin<PianoRollPluginEvents, P
         this.playingNotes.add(noteId)
 
         const freq = Tone.Frequency(note.pitch, 'midi').toFrequency()
-        const noteName = Tone.Frequency(note.pitch, 'midi').toNote()
 
         switch (this.currentSynthType) {
             case 'sine':
@@ -363,9 +373,7 @@ export default class PianoRollPlugin extends BasePlugin<PianoRollPluginEvents, P
                 this.triangleSynth?.triggerAttack(freq, Tone.now(), note.velocity)
                 break
             case 'piano':
-                if (this.pianoLoaded && this.pianoSynth) {
-                    this.pianoSynth.keyDown({ note: noteName, velocity: note.velocity })
-                }
+                this.pianoSynth?.triggerAttack(freq, Tone.now(), note.velocity)
                 break
         }
     }
@@ -379,7 +387,6 @@ export default class PianoRollPlugin extends BasePlugin<PianoRollPluginEvents, P
         this.playingNotes.delete(noteId)
 
         const freq = Tone.Frequency(note.pitch, 'midi').toFrequency()
-        const noteName = Tone.Frequency(note.pitch, 'midi').toNote()
 
         switch (this.currentSynthType) {
             case 'sine':
@@ -389,9 +396,7 @@ export default class PianoRollPlugin extends BasePlugin<PianoRollPluginEvents, P
                 this.triangleSynth?.triggerRelease(freq, Tone.now())
                 break
             case 'piano':
-                if (this.pianoLoaded && this.pianoSynth) {
-                    this.pianoSynth.keyUp({ note: noteName })
-                }
+                this.pianoSynth?.triggerRelease(freq, Tone.now())
                 break
         }
     }
@@ -402,9 +407,7 @@ export default class PianoRollPlugin extends BasePlugin<PianoRollPluginEvents, P
     private stopAllPreviewNotes(): void {
         this.sineSynth?.releaseAll()
         this.triangleSynth?.releaseAll()
-        if (this.pianoLoaded && this.pianoSynth) {
-            this.pianoSynth.stopAll()
-        }
+        this.pianoSynth?.releaseAll()
         this.playingNotes.clear()
     }
 
@@ -1405,7 +1408,6 @@ export default class PianoRollPlugin extends BasePlugin<PianoRollPluginEvents, P
         if (this.pianoSynth) {
             this.pianoSynth.dispose()
             this.pianoSynth = null
-            this.pianoLoaded = false
         }
 
         this.container = null
