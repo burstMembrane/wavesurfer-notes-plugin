@@ -1,0 +1,37 @@
+{
+  "name": "wavesurfer-piano-roll-plugin",
+  "version": "0.2.0",
+  "type": "module",
+  "files": [
+    "dist"
+  ],
+  "main": "./dist/piano-roll-plugin.umd.js",
+  "module": "./dist/piano-roll-plugin.es.js",
+  "exports": {
+    ".": {
+      "import": "./dist/piano-roll-plugin.es.js",
+      "require": "./dist/piano-roll-plugin.umd.js"
+    }
+  },
+  "scripts": {
+    "dev": "vite --config vite.dev.config.ts",
+    "build": "tsc && vite build",
+    "build-example": "vite build --config vite.dev.config.ts",
+    "preview": "vite preview",
+    "prepublishOnly": "bun run build"
+  },
+  "devDependencies": {
+    "typescript": "^5.8.3",
+    "vite": "^6.3.5",
+    "vite-plugin-dts": "^4.5.4"
+  },
+  "dependencies": {
+    "@tonejs/midi": "^2.0.28",
+    "@tonejs/piano": "^0.2.1",
+    "tone": "^15.1.22",
+    "wavesurfer.js": "^7.0.0"
+  },
+  "peerDependencies": {
+    "wavesurfer.js": "^7.0.0"
+  }
+}
