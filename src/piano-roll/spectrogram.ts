@@ -230,9 +230,12 @@ export function renderSpectrogramToImageData(
     const dbRange = maxDb - minDb
 
     for (let x = 0; x < width; x++) {
-        // Map x to frame index
-        const frameIndex = Math.floor((x / width) * spectrogram.length)
+        // Map x to frame index with interpolation
+        const frameFloat = (x / width) * (spectrogram.length - 1)
+        const frameIndex = Math.floor(frameFloat)
+        const frameFrac = frameFloat - frameIndex
         const frame = spectrogram[Math.min(frameIndex, spectrogram.length - 1)]
+        const frameNext = spectrogram[Math.min(frameIndex + 1, spectrogram.length - 1)]
 
         for (let y = 0; y < height; y++) {
             // Map y to MIDI pitch LINEARLY (high pitch at top, matching piano roll)
@@ -243,14 +246,29 @@ export function renderSpectrogramToImageData(
             // Convert pitch to frequency (logarithmic relationship)
             const frequency = midiToHz(pitch)
 
-            // Convert frequency to FFT bin
-            const bin = Math.round((frequency / sampleRate) * fftSize)
+            // Convert frequency to FFT bin with bilinear interpolation
+            const binFloat = (frequency / sampleRate) * fftSize
+            const binLow = Math.floor(binFloat)
+            const binHigh = Math.min(binLow + 1, frame.length - 1)
+            const binFrac = binFloat - binLow
 
-            // Clamp bin to valid range
-            const clampedBin = Math.max(0, Math.min(bin, frame.length - 1))
+            // Clamp bins to valid range
+            const binLowClamped = Math.max(0, Math.min(binLow, frame.length - 1))
+            const binHighClamped = Math.max(0, Math.min(binHigh, frame.length - 1))
 
-            // Get magnitude and convert to dB
-            const magnitude = frame[clampedBin] || 0
+            // Bilinear interpolation: interpolate between bins and frames
+            const mag00 = frame[binLowClamped] || 0
+            const mag01 = frame[binHighClamped] || 0
+            const mag10 = frameNext[binLowClamped] || 0
+            const mag11 = frameNext[binHighClamped] || 0
+
+            // Interpolate in bin direction for both frames
+            const mag0 = mag00 * (1 - binFrac) + mag01 * binFrac
+            const mag1 = mag10 * (1 - binFrac) + mag11 * binFrac
+
+            // Interpolate in time direction
+            const magnitude = mag0 * (1 - frameFrac) + mag1 * frameFrac
+
             const db = magnitude > 0 ? 20 * Math.log10(magnitude / maxMag) : minDb
             const normalized = Math.max(0, (db - minDb) / dbRange)
 

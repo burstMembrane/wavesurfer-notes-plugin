@@ -12,6 +12,18 @@ export type PianoRollPluginEvents = {
     noteclick: [note: PianoRollNote, event: MouseEvent]
     /** Emitted when hovering over a note */
     notehover: [note: PianoRollNote | null, event: MouseEvent]
+    /** Emitted when a note is dragged (moved or pitch changed) */
+    notedrag: [note: PianoRollNote, originalNote: PianoRollNote]
+    /** Emitted when a note is resized (duration changed) */
+    noteresize: [note: PianoRollNote, originalNote: PianoRollNote]
+    /** Emitted when a new note is created (double-click) */
+    notecreate: [note: PianoRollNote]
+    /** Emitted when a note is deleted (shift+click) */
+    notedelete: [note: PianoRollNote]
+    /** Emitted when note selection changes */
+    selectionchange: [notes: PianoRollNote[]]
+    /** Emitted after any note edit operation completes */
+    noteschange: []
 }
 
 /** Color mode for notes */
@@ -80,6 +92,19 @@ export interface PianoRollPluginOptions {
      * - 'viridis': Viridis color scheme
      */
     spectrogramColorMap?: 'default' | 'grayscale' | 'viridis'
+    /**
+     * Spectrogram overlap ratio (0-0.95).
+     * Higher values = more FFT frames = smoother time resolution.
+     * Default: 0.75 (75% overlap)
+     */
+    spectrogramOverlap?: number
+    /**
+     * Enable snapping to spectrogram peaks when double-clicking.
+     * When enabled, double-click will detect bright regions in the spectrogram
+     * and create notes that match the detected pitch and duration.
+     * Default: false
+     */
+    snapToSpectrogram?: boolean
 }
 
 /**

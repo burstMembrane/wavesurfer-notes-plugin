@@ -96,12 +96,50 @@ export default class PianoRollPlugin extends BasePlugin<PianoRollPluginEvents, P
     // Preview synth state
     private previewEnabled = false
     private previewButton: HTMLButtonElement | null = null
+
+    // Snap to spectrogram state
+    private snapEnabled = false
+    private snapCheckbox: HTMLInputElement | null = null
     private synthTypeSelect: HTMLSelectElement | null = null
     private currentSynthType: PreviewSynthType = 'synth'
     private sineSynth: Tone.PolySynth | null = null
     private triangleSynth: Tone.PolySynth | null = null
     private pianoSynth: Tone.PolySynth | null = null  // FM synth with piano-like sound
     private playingNotes: Set<string> = new Set() // Track which notes are currently sounding
+
+    // Drag state for note editing (supports multi-select)
+    private dragState: {
+        note: PianoRollNote
+        originalNote: PianoRollNote
+        mode: 'move' | 'resize-left' | 'resize-right'
+        startX: number
+        startY: number
+        offsetX: number
+        offsetY: number
+        lastPreviewPitch: number
+        // For multi-select drag: all selected notes and their originals
+        multiDrag?: {
+            notes: PianoRollNote[]
+            originals: PianoRollNote[]
+        }
+    } | null = null
+    private readonly EDGE_THRESHOLD = 8 // Pixels from edge to trigger resize mode
+    private readonly MIN_NOTE_DURATION = 0.05 // Minimum note duration in seconds
+
+    // FFT size for spectrogram (can be changed at runtime)
+    private currentFftSize: number = 1024
+    private fftSelect: HTMLSelectElement | null = null
+    private cachedAudioBuffer: AudioBuffer | null = null
+
+    // Selection state for multi-select
+    private selectedNotes: Set<PianoRollNote> = new Set()
+    private selectionBox: {
+        startX: number
+        startY: number
+        endX: number
+        endY: number
+        active: boolean
+    } | null = null
 
     constructor(options: PianoRollPluginOptions = {}) {
         super(options)
@@ -146,6 +184,8 @@ export default class PianoRollPlugin extends BasePlugin<PianoRollPluginEvents, P
             frequencyMax: this.options.frequencyMax ?? 20000,
             spectrogramOpacity: this.options.spectrogramOpacity ?? 0.7,
             spectrogramColorMap: this.options.spectrogramColorMap ?? 'default',
+            spectrogramOverlap: this.options.spectrogramOverlap ?? 0.75,
+            snapToSpectrogram: this.options.snapToSpectrogram ?? false,
         }
     }
 
@@ -186,21 +226,29 @@ export default class PianoRollPlugin extends BasePlugin<PianoRollPluginEvents, P
     }
 
     /**
+     * Get the display height (CSS pixels, not canvas pixels which may be DPR-scaled)
+     */
+    private getDisplayHeight(): number {
+        return this.getOptions().height
+    }
+
+    /**
      * Convert MIDI pitch to Y pixel position
      */
     private pitchToPx(pitch: number): number {
         if (!this.canvas) return 0
         const pitches = this.getDisplayPitches()
-        const noteHeight = this.canvas.height / pitches.length
+        const displayHeight = this.getDisplayHeight()
+        const noteHeight = displayHeight / pitches.length
 
         if (this.isFolded) {
             // Find index of pitch in used pitches (reversed for high at top)
             const idx = pitches.indexOf(pitch)
             if (idx === -1) return -100 // Off-screen if not in list
-            return this.canvas.height - ((idx + 1) * noteHeight)
+            return displayHeight - ((idx + 1) * noteHeight)
         } else {
             // Higher pitches at top (lower Y)
-            return this.canvas.height - ((pitch - this.minPitch + 1) * noteHeight)
+            return displayHeight - ((pitch - this.minPitch + 1) * noteHeight)
         }
     }
 
@@ -210,7 +258,31 @@ export default class PianoRollPlugin extends BasePlugin<PianoRollPluginEvents, P
     private getNoteHeight(): number {
         if (!this.canvas) return 10
         const pitches = this.getDisplayPitches()
-        return this.canvas.height / pitches.length
+        const displayHeight = this.getDisplayHeight()
+        return displayHeight / pitches.length
+    }
+
+    /**
+     * Convert Y pixel position to MIDI pitch (reverse of pitchToPx)
+     */
+    private pxToPitch(y: number): number {
+        if (!this.canvas) return 60 // Middle C fallback
+        const pitches = this.getDisplayPitches()
+        const displayHeight = this.getDisplayHeight()
+        const noteHeight = displayHeight / pitches.length
+
+        if (this.isFolded) {
+            // In folded mode: find which pitch index this Y falls into
+            const idx = Math.floor((displayHeight - y) / noteHeight)
+            if (idx < 0) return pitches[0]
+            if (idx >= pitches.length) return pitches[pitches.length - 1]
+            return pitches[idx]
+        } else {
+            // In full mode: calculate from pitch range
+            // Reverse of: y = displayHeight - ((pitch - minPitch + 1) * noteHeight)
+            const pitch = this.minPitch + (displayHeight - y) / noteHeight - 1
+            return clampPitch(Math.round(pitch))
+        }
     }
 
     /**
@@ -231,6 +303,25 @@ export default class PianoRollPlugin extends BasePlugin<PianoRollPluginEvents, P
         this.isFolded = !this.isFolded
         this.updateFoldButton()
         this.render()
+    }
+
+    /**
+     * Set FFT size for spectrogram and recalculate
+     */
+    public setFftSize(size: number): void {
+        // Ensure size is a power of 2
+        const validSizes = [256, 512, 1024, 2048, 4096, 8192]
+        if (!validSizes.includes(size)) {
+            console.warn(`Invalid FFT size ${size}, must be one of: ${validSizes.join(', ')}`)
+            return
+        }
+
+        this.currentFftSize = size
+
+        // Recalculate spectrogram if we have cached audio
+        if (this.cachedAudioBuffer) {
+            this.calculateSpectrogramData(this.cachedAudioBuffer)
+        }
     }
 
     /**
@@ -447,6 +538,9 @@ export default class PianoRollPlugin extends BasePlugin<PianoRollPluginEvents, P
         const opts = this.getOptions()
         const wavesurferWrapper = this.wavesurfer.getWrapper()
 
+        // Initialize FFT size from options
+        this.currentFftSize = opts.fftSamples
+
         // Create container for piano roll - append to wavesurfer wrapper like spectrogram does
         this.container = document.createElement('div')
         this.container.style.position = 'relative'
@@ -514,6 +608,10 @@ export default class PianoRollPlugin extends BasePlugin<PianoRollPluginEvents, P
             this.controlsContainer.style.display = 'flex'
             this.controlsContainer.style.gap = '4px'
 
+            // Prevent clicks on controls from triggering canvas events
+            this.controlsContainer.addEventListener('mousedown', (e) => e.stopPropagation())
+            this.controlsContainer.addEventListener('dblclick', (e) => e.stopPropagation())
+
             this.foldButton = document.createElement('button')
             this.foldButton.textContent = 'Fold'
             this.foldButton.style.padding = '4px 8px'
@@ -525,7 +623,11 @@ export default class PianoRollPlugin extends BasePlugin<PianoRollPluginEvents, P
             this.foldButton.style.color = '#fff'
             this.foldButton.style.cursor = 'pointer'
             this.foldButton.style.transition = 'background-color 0.15s'
-            this.foldButton.addEventListener('click', () => this.toggleFold())
+            this.foldButton.addEventListener('click', (e) => {
+                e.stopPropagation()
+                e.preventDefault()
+                this.toggleFold()
+            })
             this.foldButton.addEventListener('mouseenter', () => {
                 if (this.foldButton) {
                     this.foldButton.style.backgroundColor = this.isFolded ? '#5ee0b4' : '#444'
@@ -550,7 +652,11 @@ export default class PianoRollPlugin extends BasePlugin<PianoRollPluginEvents, P
             this.previewButton.style.color = '#fff'
             this.previewButton.style.cursor = 'pointer'
             this.previewButton.style.transition = 'background-color 0.15s'
-            this.previewButton.addEventListener('click', () => this.togglePreview())
+            this.previewButton.addEventListener('click', (e) => {
+                e.stopPropagation()
+                e.preventDefault()
+                this.togglePreview()
+            })
             this.previewButton.addEventListener('mouseenter', () => {
                 if (this.previewButton) {
                     this.previewButton.style.backgroundColor = this.previewEnabled ? '#5ee0b4' : '#444'
@@ -577,9 +683,120 @@ export default class PianoRollPlugin extends BasePlugin<PianoRollPluginEvents, P
                 <option value="piano">Piano</option>
             `
             this.synthTypeSelect.addEventListener('change', (e) => {
+                e.stopPropagation()
                 this.setSynthType((e.target as HTMLSelectElement).value as PreviewSynthType)
             })
+            this.synthTypeSelect.addEventListener('click', (e) => e.stopPropagation())
             this.controlsContainer.appendChild(this.synthTypeSelect)
+
+            // Add export buttons
+            const exportMidiBtn = document.createElement('button')
+            exportMidiBtn.textContent = 'MIDI'
+            exportMidiBtn.title = 'Export notes as MIDI file'
+            exportMidiBtn.style.padding = '4px 8px'
+            exportMidiBtn.style.fontSize = '11px'
+            exportMidiBtn.style.fontWeight = '500'
+            exportMidiBtn.style.border = 'none'
+            exportMidiBtn.style.borderRadius = '4px'
+            exportMidiBtn.style.backgroundColor = '#333'
+            exportMidiBtn.style.color = '#fff'
+            exportMidiBtn.style.cursor = 'pointer'
+            exportMidiBtn.style.transition = 'background-color 0.15s'
+            exportMidiBtn.addEventListener('click', (e) => {
+                e.stopPropagation()
+                e.preventDefault()
+                this.exportMidi()
+            })
+            exportMidiBtn.addEventListener('mouseenter', () => {
+                exportMidiBtn.style.backgroundColor = '#444'
+            })
+            exportMidiBtn.addEventListener('mouseleave', () => {
+                exportMidiBtn.style.backgroundColor = '#333'
+            })
+            this.controlsContainer.appendChild(exportMidiBtn)
+
+            const exportJsonBtn = document.createElement('button')
+            exportJsonBtn.textContent = 'JSON'
+            exportJsonBtn.title = 'Export notes as JSON file'
+            exportJsonBtn.style.padding = '4px 8px'
+            exportJsonBtn.style.fontSize = '11px'
+            exportJsonBtn.style.fontWeight = '500'
+            exportJsonBtn.style.border = 'none'
+            exportJsonBtn.style.borderRadius = '4px'
+            exportJsonBtn.style.backgroundColor = '#333'
+            exportJsonBtn.style.color = '#fff'
+            exportJsonBtn.style.cursor = 'pointer'
+            exportJsonBtn.style.transition = 'background-color 0.15s'
+            exportJsonBtn.addEventListener('click', (e) => {
+                e.stopPropagation()
+                e.preventDefault()
+                this.exportJSON()
+            })
+            exportJsonBtn.addEventListener('mouseenter', () => {
+                exportJsonBtn.style.backgroundColor = '#444'
+            })
+            exportJsonBtn.addEventListener('mouseleave', () => {
+                exportJsonBtn.style.backgroundColor = '#333'
+            })
+            this.controlsContainer.appendChild(exportJsonBtn)
+
+            // Add FFT size selector if spectrogram is enabled
+            if (opts.showSpectrogram) {
+                this.fftSelect = document.createElement('select')
+                this.fftSelect.title = 'FFT size for spectrogram'
+                this.fftSelect.style.padding = '4px 6px'
+                this.fftSelect.style.fontSize = '11px'
+                this.fftSelect.style.border = 'none'
+                this.fftSelect.style.borderRadius = '4px'
+                this.fftSelect.style.backgroundColor = '#333'
+                this.fftSelect.style.color = '#fff'
+                this.fftSelect.style.cursor = 'pointer'
+
+                const fftSizes = [256, 512, 1024, 2048, 4096, 8192]
+                this.fftSelect.innerHTML = fftSizes.map(size =>
+                    `<option value="${size}" ${size === this.currentFftSize ? 'selected' : ''}>FFT ${size}</option>`
+                ).join('')
+
+                this.fftSelect.addEventListener('change', (e) => {
+                    e.stopPropagation()
+                    const size = parseInt((e.target as HTMLSelectElement).value, 10)
+                    this.setFftSize(size)
+                })
+                this.fftSelect.addEventListener('click', (e) => e.stopPropagation())
+                this.controlsContainer.appendChild(this.fftSelect)
+
+                // Add snap to spectrogram checkbox
+                const snapLabel = document.createElement('label')
+                snapLabel.style.display = 'flex'
+                snapLabel.style.alignItems = 'center'
+                snapLabel.style.gap = '4px'
+                snapLabel.style.padding = '4px 8px'
+                snapLabel.style.fontSize = '11px'
+                snapLabel.style.color = '#fff'
+                snapLabel.style.cursor = 'pointer'
+                snapLabel.style.backgroundColor = '#333'
+                snapLabel.style.borderRadius = '4px'
+                snapLabel.title = 'Double-click snaps to bright spectrogram regions'
+
+                this.snapCheckbox = document.createElement('input')
+                this.snapCheckbox.type = 'checkbox'
+                this.snapCheckbox.checked = opts.snapToSpectrogram
+                this.snapEnabled = opts.snapToSpectrogram
+                this.snapCheckbox.style.cursor = 'pointer'
+                this.snapCheckbox.addEventListener('change', (e) => {
+                    e.stopPropagation()
+                    this.snapEnabled = (e.target as HTMLInputElement).checked
+                })
+                this.snapCheckbox.addEventListener('click', (e) => e.stopPropagation())
+
+                const snapText = document.createElement('span')
+                snapText.textContent = 'Snap'
+
+                snapLabel.appendChild(this.snapCheckbox)
+                snapLabel.appendChild(snapText)
+                snapLabel.addEventListener('click', (e) => e.stopPropagation())
+                this.controlsContainer.appendChild(snapLabel)
+            }
 
             this.container.appendChild(this.controlsContainer)
         }
@@ -599,9 +816,11 @@ export default class PianoRollPlugin extends BasePlugin<PianoRollPluginEvents, P
         this.tooltip.style.whiteSpace = 'nowrap'
         this.container.appendChild(this.tooltip)
 
-        // Add mouse event listeners for hover
+        // Add mouse event listeners for hover and editing
         this.container.addEventListener('mousemove', this.onMouseMove)
         this.container.addEventListener('mouseleave', this.onMouseLeave)
+        this.container.addEventListener('mousedown', this.onMouseDown)
+        this.container.addEventListener('dblclick', this.onDoubleClick)
 
         // Insert container inside wavesurfer wrapper (like spectrogram does)
         wavesurferWrapper.appendChild(this.container)
@@ -615,22 +834,34 @@ export default class PianoRollPlugin extends BasePlugin<PianoRollPluginEvents, P
      * Resize the canvas to match waveform dimensions
      */
     private resizeCanvas(): void {
-        if (!this.canvas || !this.wavesurfer) return
+        if (!this.canvas || !this.wavesurfer || !this.ctx) return
 
         const opts = this.getOptions()
         const wrapper = this.wavesurfer.getWrapper()
+        const dpr = window.devicePixelRatio || 1
 
-        // Match the wrapper's scroll width (full zoomed width)
-        this.canvas.width = wrapper.scrollWidth
-        this.canvas.height = opts.height
+        const displayWidth = wrapper.scrollWidth
+        const displayHeight = opts.height
 
-        // Also resize spectrogram canvas
+        // Set canvas size in pixels (scaled for DPI)
+        this.canvas.width = displayWidth * dpr
+        this.canvas.height = displayHeight * dpr
+
+        // Set display size via CSS
+        this.canvas.style.width = `${displayWidth}px`
+        this.canvas.style.height = `${displayHeight}px`
+
+        // Scale context to match DPR
+        this.ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
+
+        // Resize spectrogram canvas (no DPR scaling - uses ImageData directly)
+        // The bilinear interpolation provides smoothness instead of DPR scaling
         if (this.spectrogramCanvas) {
-            this.spectrogramCanvas.width = wrapper.scrollWidth
-            this.spectrogramCanvas.height = opts.height
+            this.spectrogramCanvas.width = displayWidth
+            this.spectrogramCanvas.height = displayHeight
+            this.spectrogramCanvas.style.width = `${displayWidth}px`
+            this.spectrogramCanvas.style.height = `${displayHeight}px`
         }
-
-        // No need to manually offset - we're inside the scrolling wrapper now
     }
 
     /**
@@ -652,8 +883,10 @@ export default class PianoRollPlugin extends BasePlugin<PianoRollPluginEvents, P
 
         const opts = this.getOptions()
         const ctx = this.ctx
-        const width = this.canvas.width
-        const height = this.canvas.height
+        const wrapper = this.wavesurfer.getWrapper()
+        // Use display dimensions (not canvas pixel dimensions which are DPR-scaled)
+        const width = wrapper.scrollWidth
+        const height = this.getDisplayHeight()
         const duration = this.wavesurfer.getDuration()
 
         // Clear the canvas first (transparent background to show spectrogram)
@@ -727,6 +960,71 @@ export default class PianoRollPlugin extends BasePlugin<PianoRollPluginEvents, P
         const opts = this.getOptions()
         const noteHeight = this.getNoteHeight()
 
+        // Draw ghost of original position if dragging
+        if (this.dragState) {
+            const { originalNote, note, multiDrag } = this.dragState
+
+            if (multiDrag) {
+                // Multi-drag: draw ghosts for all selected notes
+                for (let i = 0; i < multiDrag.notes.length; i++) {
+                    const n = multiDrag.notes[i]
+                    const orig = multiDrag.originals[i]
+
+                    const hasChanged =
+                        n.onset !== orig.onset ||
+                        n.offset !== orig.offset ||
+                        n.pitch !== orig.pitch
+
+                    if (hasChanged) {
+                        const gx = this.timeToPx(orig.onset)
+                        const gw = Math.max(this.timeToPx(orig.offset) - gx, 2)
+                        const gy = this.pitchToPx(orig.pitch)
+                        const gh = noteHeight - 1
+
+                        ctx.save()
+                        ctx.globalAlpha = 0.3
+                        ctx.fillStyle = this.getNoteColor(orig)
+                        ctx.beginPath()
+                        ctx.roundRect(gx, gy, gw, gh, opts.noteRadius)
+                        ctx.fill()
+
+                        ctx.setLineDash([4, 4])
+                        ctx.strokeStyle = '#ffffff'
+                        ctx.lineWidth = 1
+                        ctx.stroke()
+                        ctx.restore()
+                    }
+                }
+            } else {
+                // Single note ghost
+                const hasChanged =
+                    note.onset !== originalNote.onset ||
+                    note.offset !== originalNote.offset ||
+                    note.pitch !== originalNote.pitch
+
+                if (hasChanged) {
+                    const gx = this.timeToPx(originalNote.onset)
+                    const gw = Math.max(this.timeToPx(originalNote.offset) - gx, 2)
+                    const gy = this.pitchToPx(originalNote.pitch)
+                    const gh = noteHeight - 1
+
+                    // Draw ghost rectangle (semi-transparent, dashed border)
+                    ctx.save()
+                    ctx.globalAlpha = 0.3
+                    ctx.fillStyle = this.getNoteColor(originalNote)
+                    ctx.beginPath()
+                    ctx.roundRect(gx, gy, gw, gh, opts.noteRadius)
+                    ctx.fill()
+
+                    ctx.setLineDash([4, 4])
+                    ctx.strokeStyle = '#ffffff'
+                    ctx.lineWidth = 1
+                    ctx.stroke()
+                    ctx.restore()
+                }
+            }
+        }
+
         for (const note of this.notes) {
             // Skip notes outside visible pitch range
             if (note.pitch < this.minPitch || note.pitch > this.maxPitch) continue
@@ -737,13 +1035,15 @@ export default class PianoRollPlugin extends BasePlugin<PianoRollPluginEvents, P
             const h = noteHeight - 1
 
             const isActive = this.activeNotes.has(note)
+            const isDragging = this.dragState?.note === note
+            const isSelected = this.selectedNotes.has(note)
 
-            // Draw glow for active notes
-            if (isActive && opts.activeNoteGlow) {
+            // Draw glow for active, dragged, or selected notes
+            if ((isActive && opts.activeNoteGlow) || isDragging || isSelected) {
                 ctx.save()
-                ctx.shadowColor = opts.activeNoteColor
-                ctx.shadowBlur = 15
-                ctx.fillStyle = opts.activeNoteColor
+                ctx.shadowColor = isDragging ? '#00ffff' : isSelected ? '#ffff00' : opts.activeNoteColor
+                ctx.shadowBlur = isDragging ? 20 : isSelected ? 12 : 15
+                ctx.fillStyle = isDragging ? '#00ffff' : isSelected ? '#ffff00' : opts.activeNoteColor
                 ctx.beginPath()
                 ctx.roundRect(x, y, w, h, opts.noteRadius)
                 ctx.fill()
@@ -751,18 +1051,59 @@ export default class PianoRollPlugin extends BasePlugin<PianoRollPluginEvents, P
             }
 
             // Draw note rectangle
-            ctx.fillStyle = isActive ? opts.activeNoteColor : this.getNoteColor(note)
+            let fillColor = this.getNoteColor(note)
+            if (isActive) {
+                fillColor = opts.activeNoteColor
+            } else if (isDragging) {
+                // Slightly brighter color when dragging
+                fillColor = '#00dddd'
+            } else if (isSelected) {
+                // Tint selected notes yellow
+                fillColor = '#ffcc00'
+            }
+
+            ctx.fillStyle = fillColor
             ctx.beginPath()
             ctx.roundRect(x, y, w, h, opts.noteRadius)
             ctx.fill()
 
             // Draw border
             if (opts.noteBorderWidth > 0) {
-                ctx.strokeStyle = isActive ? opts.activeNoteColor : opts.noteBorderColor
-                ctx.lineWidth = isActive ? 2 : opts.noteBorderWidth
+                ctx.strokeStyle = isActive ? opts.activeNoteColor : isDragging ? '#00ffff' : isSelected ? '#ffff00' : opts.noteBorderColor
+                ctx.lineWidth = (isActive || isDragging || isSelected) ? 2 : opts.noteBorderWidth
                 ctx.stroke()
             }
         }
+
+        // Draw selection box if active
+        this.renderSelectionBox()
+    }
+
+    /**
+     * Render the selection box during drag
+     */
+    private renderSelectionBox(): void {
+        if (!this.selectionBox || !this.ctx) return
+
+        const ctx = this.ctx
+        const box = this.selectionBox
+
+        const x = Math.min(box.startX, box.endX)
+        const y = Math.min(box.startY, box.endY)
+        const w = Math.abs(box.endX - box.startX)
+        const h = Math.abs(box.endY - box.startY)
+
+        // Draw semi-transparent fill
+        ctx.save()
+        ctx.fillStyle = 'rgba(255, 255, 0, 0.1)'
+        ctx.fillRect(x, y, w, h)
+
+        // Draw dashed border
+        ctx.setLineDash([4, 4])
+        ctx.strokeStyle = '#ffff00'
+        ctx.lineWidth = 1
+        ctx.strokeRect(x, y, w, h)
+        ctx.restore()
     }
 
     /**
@@ -772,12 +1113,19 @@ export default class PianoRollPlugin extends BasePlugin<PianoRollPluginEvents, P
         if (!this.keyboardCtx || !this.keyboardCanvas) return
 
         const ctx = this.keyboardCtx
+        const opts = this.getOptions()
         const width = this.keyboardCanvas.width
         const height = this.keyboardCanvas.height
 
         // Clear
         ctx.fillStyle = '#0a0a15'
         ctx.fillRect(0, 0, width, height)
+
+        // Build set of active pitches for quick lookup
+        const activePitches = new Set<number>()
+        for (const note of this.activeNotes) {
+            activePitches.add(note.pitch)
+        }
 
         // Use display pitches (respects fold state)
         const pitches = this.getDisplayPitches()
@@ -788,8 +1136,13 @@ export default class PianoRollPlugin extends BasePlugin<PianoRollPluginEvents, P
             const pitch = pitches[pitches.length - 1 - i] // Reversed order
             const y = i * noteHeight
             const isBlack = isBlackKey(pitch)
+            const isActive = activePitches.has(pitch)
 
-            if (isBlack) {
+            if (isActive) {
+                // Active key - use playhead color (red)
+                ctx.fillStyle = opts.playheadColor
+                ctx.fillRect(0, y, width, noteHeight - 1)
+            } else if (isBlack) {
                 // Black key
                 ctx.fillStyle = '#1a1a1a'
                 ctx.fillRect(0, y, width * 0.6, noteHeight - 1)
@@ -802,9 +1155,9 @@ export default class PianoRollPlugin extends BasePlugin<PianoRollPluginEvents, P
             // Draw note name for C notes or when folded (show all note names)
             const showLabel = this.isFolded || pitch % 12 === 0
             if (showLabel && noteHeight >= 10) {
-                ctx.fillStyle = isBlack ? '#aaa' : '#333'
+                ctx.fillStyle = isActive ? '#fff' : (isBlack ? '#aaa' : '#333')
                 ctx.font = `${Math.min(10, Math.max(8, noteHeight - 2))}px sans-serif`
-                const labelX = isBlack ? width * 0.65 : 2
+                const labelX = isActive ? 2 : (isBlack ? width * 0.65 : 2)
                 ctx.fillText(pitchToNoteName(pitch), labelX, y + noteHeight - 2)
             }
 
@@ -847,12 +1200,13 @@ export default class PianoRollPlugin extends BasePlugin<PianoRollPluginEvents, P
         const frequencyMax = midiToHz(maxDisplayPitch + 0.5)
 
         // Render spectrogram to image data with pitch-aligned frequency range
+        // Use currentFftSize which may have been changed by the user
         const imageData = renderSpectrogramToImageData(
             this.spectrogramData,
             width,
             height,
             this.audioSampleRate,
-            opts.fftSamples,
+            this.currentFftSize,
             frequencyMin,
             frequencyMax,
             opts.spectrogramColorMap as ColorMapType
@@ -869,6 +1223,8 @@ export default class PianoRollPlugin extends BasePlugin<PianoRollPluginEvents, P
         const opts = this.getOptions()
         if (!opts.showSpectrogram) return
 
+        // Cache audio buffer for FFT size changes
+        this.cachedAudioBuffer = audioBuffer
         this.audioSampleRate = audioBuffer.sampleRate
 
         // Get mono audio data (mix channels if stereo)
@@ -885,12 +1241,15 @@ export default class PianoRollPlugin extends BasePlugin<PianoRollPluginEvents, P
             }
         }
 
-        // Calculate spectrogram
-        const hopSize = Math.floor(opts.fftSamples / 4)
+        // Calculate spectrogram using current FFT size and overlap
+        const fftSize = this.currentFftSize
+        // Clamp overlap to valid range (0-0.95)
+        const overlap = Math.max(0, Math.min(0.95, opts.spectrogramOverlap))
+        const hopSize = Math.max(1, Math.floor(fftSize * (1 - overlap)))
         this.spectrogramData = calculateSpectrogram(
             audioData,
             this.audioSampleRate,
-            opts.fftSamples,
+            fftSize,
             hopSize
         )
 
@@ -952,6 +1311,9 @@ export default class PianoRollPlugin extends BasePlugin<PianoRollPluginEvents, P
     private onMouseMove = (event: MouseEvent): void => {
         if (!this.container || !this.wavesurfer) return
 
+        // Don't update hover state during drag
+        if (this.dragState) return
+
         const rect = this.container.getBoundingClientRect()
         const x = event.clientX - rect.left
         const y = event.clientY - rect.top
@@ -959,6 +1321,9 @@ export default class PianoRollPlugin extends BasePlugin<PianoRollPluginEvents, P
         // Since container is inside the scrolling wrapper, getBoundingClientRect
         // already accounts for scroll position - x is the absolute position
         const note = this.findNoteAtPosition(x, y)
+
+        // Update cursor based on hover position and modifier keys
+        this.updateCursor(x, note, event.shiftKey)
 
         if (note !== this.hoveredNote) {
             this.hoveredNote = note
@@ -978,6 +1343,595 @@ export default class PianoRollPlugin extends BasePlugin<PianoRollPluginEvents, P
         if (this.tooltip) {
             this.tooltip.style.display = 'none'
         }
+        // Reset cursor when leaving
+        if (this.container && !this.dragState) {
+            this.container.style.cursor = 'default'
+        }
+    }
+
+    /**
+     * Determine drag mode based on click position relative to note
+     */
+    private getDragMode(x: number, note: PianoRollNote): 'move' | 'resize-left' | 'resize-right' {
+        const noteX = this.timeToPx(note.onset)
+        const noteW = Math.max(this.timeToPx(note.offset) - noteX, 2)
+
+        // Check if near left edge
+        if (x - noteX < this.EDGE_THRESHOLD) {
+            return 'resize-left'
+        }
+        // Check if near right edge
+        if (noteX + noteW - x < this.EDGE_THRESHOLD) {
+            return 'resize-right'
+        }
+        return 'move'
+    }
+
+    /**
+     * Handle mouse down for note dragging, deletion, or box selection
+     */
+    private onMouseDown = (event: MouseEvent): void => {
+        if (!this.container) return
+
+        const rect = this.container.getBoundingClientRect()
+        const x = event.clientX - rect.left
+        const y = event.clientY - rect.top
+
+        const note = this.findNoteAtPosition(x, y)
+
+        // If clicking on empty space, start box selection
+        if (!note) {
+            event.preventDefault()
+
+            // Clear existing selection unless shift is held
+            if (!event.shiftKey) {
+                this.selectedNotes.clear()
+                this.emit('selectionchange', [])
+            }
+
+            // Start box selection
+            this.selectionBox = {
+                startX: x,
+                startY: y,
+                endX: x,
+                endY: y,
+                active: true,
+            }
+
+            this.container.style.cursor = 'crosshair'
+
+            // Add document-level listeners for selection
+            document.addEventListener('mousemove', this.onSelectionDrag)
+            document.addEventListener('mouseup', this.onSelectionEnd)
+            return
+        }
+
+        // Shift+click to delete note
+        if (event.shiftKey) {
+            event.preventDefault()
+            this.deleteNote(note)
+            return
+        }
+
+        // Prevent text selection during drag
+        event.preventDefault()
+
+        const noteX = this.timeToPx(note.onset)
+        const noteY = this.pitchToPx(note.pitch)
+        const mode = this.getDragMode(x, note)
+
+        // Deep copy the original note for comparison/undo
+        const originalNote: PianoRollNote = { ...note }
+
+        this.dragState = {
+            note,
+            originalNote,
+            mode,
+            startX: x,
+            startY: y,
+            offsetX: x - noteX,
+            offsetY: y - noteY,
+            lastPreviewPitch: note.pitch,
+        }
+
+        // If dragging a selected note in move mode, prepare multi-drag
+        if (mode === 'move' && this.selectedNotes.has(note) && this.selectedNotes.size > 1) {
+            const notes = Array.from(this.selectedNotes)
+            const originals = notes.map(n => ({ ...n }))
+            this.dragState.multiDrag = { notes, originals }
+        }
+
+        // Update cursor
+        if (mode === 'move') {
+            this.container.style.cursor = 'grabbing'
+        } else {
+            this.container.style.cursor = 'ew-resize'
+        }
+
+        // Hide tooltip during drag
+        if (this.tooltip) {
+            this.tooltip.style.display = 'none'
+        }
+
+        // Add document-level listeners for drag
+        document.addEventListener('mousemove', this.onDragMove)
+        document.addEventListener('mouseup', this.onDragEnd)
+    }
+
+    /**
+     * Handle mouse move during drag operation
+     */
+    private onDragMove = (event: MouseEvent): void => {
+        if (!this.dragState || !this.container || !this.wavesurfer) return
+
+        const rect = this.container.getBoundingClientRect()
+        const x = event.clientX - rect.left
+        const y = event.clientY - rect.top
+
+        const { note, originalNote, mode, offsetX, multiDrag } = this.dragState
+        const duration = this.wavesurfer.getDuration()
+
+        if (mode === 'move') {
+            // Calculate delta from original position
+            const deltaTime = this.pxToTime(x - offsetX) - originalNote.onset
+            const newPitch = this.pxToPitch(y)
+            const deltaPitch = newPitch - originalNote.pitch
+
+            if (multiDrag) {
+                // Multi-select drag: move all selected notes
+                for (let i = 0; i < multiDrag.notes.length; i++) {
+                    const n = multiDrag.notes[i]
+                    const orig = multiDrag.originals[i]
+                    const noteDuration = orig.duration
+
+                    // Calculate new onset
+                    let newOnset = orig.onset + deltaTime
+                    newOnset = Math.max(0, Math.min(duration - noteDuration, newOnset))
+
+                    n.onset = newOnset
+                    n.offset = newOnset + noteDuration
+
+                    // Apply pitch delta
+                    const targetPitch = clampPitch(orig.pitch + deltaPitch)
+                    if (n.pitch !== targetPitch) {
+                        n.pitch = targetPitch
+                        n.name = pitchToNoteName(targetPitch)
+                    }
+                }
+
+                // Preview pitch change for primary note if enabled
+                if (this.previewEnabled && newPitch !== this.dragState.lastPreviewPitch) {
+                    this.previewDragPitch(newPitch)
+                    this.dragState.lastPreviewPitch = newPitch
+                }
+            } else {
+                // Single note drag
+                const noteDuration = note.duration
+                let newOnset = this.pxToTime(x - offsetX)
+
+                // Clamp to valid range
+                newOnset = Math.max(0, Math.min(duration - noteDuration, newOnset))
+
+                // Update note
+                note.onset = newOnset
+                note.offset = newOnset + noteDuration
+
+                if (note.pitch !== newPitch) {
+                    note.pitch = newPitch
+                    note.name = pitchToNoteName(newPitch)
+
+                    // Preview pitch change if enabled
+                    if (this.previewEnabled && newPitch !== this.dragState.lastPreviewPitch) {
+                        this.previewDragPitch(newPitch)
+                        this.dragState.lastPreviewPitch = newPitch
+                    }
+                }
+            }
+        } else if (mode === 'resize-left') {
+            // Resize from left edge - changes onset
+            let newOnset = this.pxToTime(x)
+            const minOnset = 0
+            const maxOnset = note.offset - this.MIN_NOTE_DURATION
+
+            newOnset = Math.max(minOnset, Math.min(maxOnset, newOnset))
+
+            note.onset = newOnset
+            note.duration = note.offset - note.onset
+        } else if (mode === 'resize-right') {
+            // Resize from right edge - changes offset
+            let newOffset = this.pxToTime(x)
+            const minOffset = note.onset + this.MIN_NOTE_DURATION
+            const maxOffset = duration
+
+            newOffset = Math.max(minOffset, Math.min(maxOffset, newOffset))
+
+            note.offset = newOffset
+            note.duration = note.offset - note.onset
+        }
+
+        // Re-render to show changes
+        this.render()
+    }
+
+    /**
+     * Preview pitch during drag operation
+     */
+    private previewDragPitch(pitch: number): void {
+        if (!this.previewEnabled) return
+
+        // Create a temporary note for preview
+        const previewNote: PianoRollNote = {
+            pitch,
+            name: pitchToNoteName(pitch),
+            onset: 0,
+            offset: 0.3,
+            duration: 0.3,
+            velocity: 0.7,
+            track: 0,
+            channel: 0,
+        }
+
+        // Stop any previous preview
+        this.stopAllPreviewNotes()
+
+        // Trigger the preview
+        this.triggerPreviewNote(previewNote)
+
+        // Auto-release after short duration
+        setTimeout(() => {
+            this.releasePreviewNote(previewNote)
+        }, 200)
+    }
+
+    /**
+     * Handle mouse up to end drag operation
+     */
+    private onDragEnd = (): void => {
+        if (!this.dragState || !this.container) return
+
+        const { note, originalNote, mode, multiDrag } = this.dragState
+
+        if (multiDrag && mode === 'move') {
+            // Multi-drag: check all notes for changes
+            let anyChanged = false
+            for (let i = 0; i < multiDrag.notes.length; i++) {
+                const n = multiDrag.notes[i]
+                const orig = multiDrag.originals[i]
+
+                const hasChanged =
+                    n.onset !== orig.onset ||
+                    n.offset !== orig.offset ||
+                    n.pitch !== orig.pitch
+
+                if (hasChanged) {
+                    anyChanged = true
+                    this.emit('notedrag', n, orig)
+                }
+            }
+
+            if (anyChanged) {
+                this.emit('noteschange')
+            }
+        } else {
+            // Single note drag
+            const hasChanged =
+                note.onset !== originalNote.onset ||
+                note.offset !== originalNote.offset ||
+                note.pitch !== originalNote.pitch
+
+            if (hasChanged) {
+                // Emit appropriate event
+                if (mode === 'move') {
+                    this.emit('notedrag', note, originalNote)
+                } else {
+                    this.emit('noteresize', note, originalNote)
+                }
+                this.emit('noteschange')
+            }
+        }
+
+        // Reset cursor
+        this.container.style.cursor = 'default'
+
+        // Stop any pitch preview
+        this.stopAllPreviewNotes()
+
+        // Clear drag state
+        this.dragState = null
+
+        // Remove document-level listeners
+        document.removeEventListener('mousemove', this.onDragMove)
+        document.removeEventListener('mouseup', this.onDragEnd)
+
+        // Re-render to finalize
+        this.render()
+    }
+
+    /**
+     * Handle mouse move during box selection
+     */
+    private onSelectionDrag = (event: MouseEvent): void => {
+        if (!this.selectionBox || !this.container) return
+
+        const rect = this.container.getBoundingClientRect()
+        const x = event.clientX - rect.left
+        const y = event.clientY - rect.top
+
+        this.selectionBox.endX = x
+        this.selectionBox.endY = y
+
+        // Re-render to show selection box
+        this.render()
+    }
+
+    /**
+     * Handle mouse up to end box selection
+     */
+    private onSelectionEnd = (): void => {
+        if (!this.selectionBox || !this.container) return
+
+        // Find all notes within the selection box
+        const box = this.selectionBox
+        const minX = Math.min(box.startX, box.endX)
+        const maxX = Math.max(box.startX, box.endX)
+        const minY = Math.min(box.startY, box.endY)
+        const maxY = Math.max(box.startY, box.endY)
+
+        const noteHeight = this.getNoteHeight()
+
+        for (const note of this.notes) {
+            // Skip notes outside visible pitch range
+            if (note.pitch < this.minPitch || note.pitch > this.maxPitch) continue
+            if (this.isFolded && !this.usedPitches.includes(note.pitch)) continue
+
+            const noteX = this.timeToPx(note.onset)
+            const noteW = Math.max(this.timeToPx(note.offset) - noteX, 2)
+            const noteY = this.pitchToPx(note.pitch)
+            const noteH = noteHeight - 1
+
+            // Check if note intersects with selection box
+            const noteRight = noteX + noteW
+            const noteBottom = noteY + noteH
+
+            if (noteX <= maxX && noteRight >= minX && noteY <= maxY && noteBottom >= minY) {
+                this.selectedNotes.add(note)
+            }
+        }
+
+        // Emit selection change event
+        this.emit('selectionchange', Array.from(this.selectedNotes))
+
+        // Reset cursor
+        this.container.style.cursor = 'default'
+
+        // Clear selection box state
+        this.selectionBox = null
+
+        // Remove document-level listeners
+        document.removeEventListener('mousemove', this.onSelectionDrag)
+        document.removeEventListener('mouseup', this.onSelectionEnd)
+
+        // Re-render to show selected notes
+        this.render()
+    }
+
+    /**
+     * Update cursor based on hover position over notes
+     */
+    private updateCursor(x: number, note: PianoRollNote | null, shiftKey = false): void {
+        if (!this.container || this.dragState) return
+
+        if (!note) {
+            this.container.style.cursor = 'default'
+            return
+        }
+
+        // Shift+hover shows delete cursor
+        if (shiftKey) {
+            this.container.style.cursor = 'not-allowed'
+            return
+        }
+
+        const mode = this.getDragMode(x, note)
+        if (mode === 'move') {
+            this.container.style.cursor = 'grab'
+        } else {
+            this.container.style.cursor = 'ew-resize'
+        }
+    }
+
+    /**
+     * Delete a note from the piano roll
+     */
+    private deleteNote(note: PianoRollNote): void {
+        const index = this.notes.indexOf(note)
+        if (index === -1) return
+
+        // Remove from array
+        this.notes.splice(index, 1)
+
+        // Update used pitches for fold mode
+        this.updateUsedPitches()
+
+        // Re-render
+        this.render()
+
+        // Emit events
+        this.emit('notedelete', note)
+        this.emit('noteschange')
+    }
+
+    /**
+     * Detect a note from spectrogram peaks at the given position
+     * Returns { pitch, onset, offset } or null if no peak detected
+     */
+    private detectSpectrogramNote(x: number, y: number): { pitch: number; onset: number; offset: number } | null {
+        if (!this.wavesurfer || this.spectrogramData.length === 0) return null
+
+        const wrapper = this.wavesurfer.getWrapper()
+        const duration = this.wavesurfer.getDuration()
+        const displayWidth = wrapper.scrollWidth
+
+        // Get the pitch at click position
+        const clickPitch = this.pxToPitch(y)
+
+        // Convert pitch to frequency
+        const clickFreq = midiToHz(clickPitch)
+
+        // Convert frequency to FFT bin
+        const binFloat = (clickFreq / this.audioSampleRate) * this.currentFftSize
+        const bin = Math.round(binFloat)
+
+        if (bin < 0 || bin >= this.currentFftSize / 2) return null
+
+        // Get frame index from x position
+        const frameFloat = (x / displayWidth) * (this.spectrogramData.length - 1)
+        const frameIndex = Math.round(frameFloat)
+
+        if (frameIndex < 0 || frameIndex >= this.spectrogramData.length) return null
+
+        // Check if there's significant energy at this bin
+        const frame = this.spectrogramData[frameIndex]
+        const magnitude = frame[bin] || 0
+
+        // Find max magnitude in this frame for threshold
+        let maxMag = 0
+        for (let i = 0; i < frame.length; i++) {
+            if (frame[i] > maxMag) maxMag = frame[i]
+        }
+
+        // If the clicked bin is below 20% of max, don't snap
+        if (magnitude < maxMag * 0.2) return null
+
+        // Threshold for detecting note presence (20% of magnitude at click point)
+        const threshold = magnitude * 0.2
+
+        // Search for the actual peak near the clicked bin (within 2 semitones)
+        const searchRadius = Math.round((clickFreq * 0.12) / this.audioSampleRate * this.currentFftSize) // ~2 semitones
+        let peakBin = bin
+        let peakMag = magnitude
+        for (let b = Math.max(0, bin - searchRadius); b <= Math.min(frame.length - 1, bin + searchRadius); b++) {
+            if (frame[b] > peakMag) {
+                peakMag = frame[b]
+                peakBin = b
+            }
+        }
+
+        // Convert peak bin back to pitch
+        const peakFreq = (peakBin * this.audioSampleRate) / this.currentFftSize
+        const detectedPitch = clampPitch(Math.round(69 + 12 * Math.log2(peakFreq / 440)))
+
+        // Search backward to find onset
+        let onsetFrame = frameIndex
+        for (let f = frameIndex - 1; f >= 0; f--) {
+            const binMag = this.spectrogramData[f][peakBin] || 0
+            if (binMag < threshold) {
+                onsetFrame = f + 1
+                break
+            }
+            onsetFrame = f
+        }
+
+        // Search forward to find offset
+        let offsetFrame = frameIndex
+        for (let f = frameIndex + 1; f < this.spectrogramData.length; f++) {
+            const binMag = this.spectrogramData[f][peakBin] || 0
+            if (binMag < threshold) {
+                offsetFrame = f - 1
+                break
+            }
+            offsetFrame = f
+        }
+
+        // Convert frame indices to time
+        const onset = (onsetFrame / (this.spectrogramData.length - 1)) * duration
+        const offset = Math.min(((offsetFrame + 1) / (this.spectrogramData.length - 1)) * duration, duration)
+
+        // Ensure minimum duration
+        if (offset - onset < this.MIN_NOTE_DURATION) {
+            return {
+                pitch: detectedPitch,
+                onset,
+                offset: onset + 0.25, // Default duration
+            }
+        }
+
+        return { pitch: detectedPitch, onset, offset }
+    }
+
+    /**
+     * Handle double-click to create new note
+     */
+    private onDoubleClick = (event: MouseEvent): void => {
+        if (!this.container || !this.wavesurfer) return
+
+        const rect = this.container.getBoundingClientRect()
+        const x = event.clientX - rect.left
+        const y = event.clientY - rect.top
+
+        // Check if clicking on existing note - don't create new one
+        const existingNote = this.findNoteAtPosition(x, y)
+        if (existingNote) return
+
+        let pitch: number
+        let onset: number
+        let offset: number
+
+        // Try to snap to spectrogram if enabled
+        if (this.snapEnabled && this.spectrogramData.length > 0) {
+            const detected = this.detectSpectrogramNote(x, y)
+            if (detected) {
+                pitch = detected.pitch
+                onset = detected.onset
+                offset = detected.offset
+            } else {
+                // No peak detected, fall back to regular behavior
+                onset = this.pxToTime(x)
+                pitch = this.pxToPitch(y)
+                const defaultDuration = 0.25
+                const duration = this.wavesurfer.getDuration()
+                offset = Math.min(onset + defaultDuration, duration)
+            }
+        } else {
+            // Regular behavior: click position determines note
+            onset = this.pxToTime(x)
+            pitch = this.pxToPitch(y)
+            const defaultDuration = 0.25
+            const duration = this.wavesurfer.getDuration()
+            offset = Math.min(onset + defaultDuration, duration)
+        }
+
+        // Create new note
+        const newNote: PianoRollNote = {
+            pitch,
+            name: pitchToNoteName(pitch),
+            onset,
+            offset,
+            duration: offset - onset,
+            velocity: 0.8,
+            track: 0,
+            channel: 0,
+        }
+
+        // Add to notes array and sort
+        this.notes.push(newNote)
+        this.notes.sort((a, b) => a.onset - b.onset)
+
+        // Update used pitches for fold mode
+        this.updateUsedPitches()
+
+        // Preview the new note if enabled
+        if (this.previewEnabled) {
+            this.triggerPreviewNote(newNote)
+            setTimeout(() => this.releasePreviewNote(newNote), 200)
+        }
+
+        // Re-render
+        this.render()
+
+        // Emit events
+        this.emit('notecreate', newNote)
+        this.emit('noteschange')
     }
 
     /**
@@ -1277,12 +2231,166 @@ export default class PianoRollPlugin extends BasePlugin<PianoRollPluginEvents, P
     }
 
     /**
+     * Get currently selected notes
+     */
+    public getSelectedNotes(): PianoRollNote[] {
+        return Array.from(this.selectedNotes)
+    }
+
+    /**
+     * Clear the current selection
+     */
+    public clearSelection(): void {
+        if (this.selectedNotes.size > 0) {
+            this.selectedNotes.clear()
+            this.render()
+            this.emit('selectionchange', [])
+        }
+    }
+
+    /**
+     * Select specific notes programmatically
+     */
+    public selectNotes(notes: PianoRollNote[]): void {
+        this.selectedNotes.clear()
+        for (const note of notes) {
+            if (this.notes.includes(note)) {
+                this.selectedNotes.add(note)
+            }
+        }
+        this.render()
+        this.emit('selectionchange', Array.from(this.selectedNotes))
+    }
+
+    /**
+     * Delete all selected notes
+     */
+    public deleteSelectedNotes(): void {
+        if (this.selectedNotes.size === 0) return
+
+        for (const note of this.selectedNotes) {
+            const index = this.notes.indexOf(note)
+            if (index !== -1) {
+                this.notes.splice(index, 1)
+                this.emit('notedelete', note)
+            }
+        }
+
+        this.selectedNotes.clear()
+        this.updateUsedPitches()
+        this.render()
+        this.emit('selectionchange', [])
+        this.emit('noteschange')
+    }
+
+    /**
      * Set the pitch range manually
      */
     public setPitchRange(min: number, max: number): void {
         this.minPitch = clampPitch(min)
         this.maxPitch = clampPitch(max)
         this.render()
+    }
+
+    // ==================== Export Methods ====================
+
+    /**
+     * Export notes to MIDI file
+     * @param filename Name for the downloaded file (default: 'notes.mid')
+     * @param tempo BPM for the MIDI file (default: 120)
+     */
+    public exportMidi(filename = 'notes.mid', tempo = 120): void {
+        if (this.notes.length === 0) {
+            console.warn('No notes to export')
+            return
+        }
+
+        // Create new MIDI
+        const midi = new Midi()
+        midi.header.setTempo(tempo)
+
+        // Group notes by track
+        const trackMap = new Map<number, PianoRollNote[]>()
+        for (const note of this.notes) {
+            const trackIdx = note.track
+            if (!trackMap.has(trackIdx)) {
+                trackMap.set(trackIdx, [])
+            }
+            trackMap.get(trackIdx)!.push(note)
+        }
+
+        // Add track for each group
+        trackMap.forEach((trackNotes, trackIdx) => {
+            const midiTrack = midi.addTrack()
+            midiTrack.name = `Track ${trackIdx + 1}`
+
+            for (const note of trackNotes) {
+                midiTrack.addNote({
+                    midi: note.pitch,
+                    time: note.onset,
+                    duration: note.duration,
+                    velocity: note.velocity,
+                })
+            }
+        })
+
+        // Convert to Uint8Array and download
+        const midiArray = midi.toArray()
+        this.downloadFile(midiArray, filename, 'audio/midi')
+    }
+
+    /**
+     * Export notes to JSON file
+     * @param filename Name for the downloaded file (default: 'notes.json')
+     */
+    public exportJSON(filename = 'notes.json'): void {
+        if (this.notes.length === 0) {
+            console.warn('No notes to export')
+            return
+        }
+
+        // Export notes with all properties
+        const exportData = {
+            version: '1.0',
+            noteCount: this.notes.length,
+            trackCount: this.trackCount,
+            pitchRange: {
+                min: this.minPitch,
+                max: this.maxPitch,
+            },
+            notes: this.notes.map(note => ({
+                pitch: note.pitch,
+                name: note.name,
+                onset: note.onset,
+                offset: note.offset,
+                duration: note.duration,
+                velocity: note.velocity,
+                track: note.track,
+                channel: note.channel,
+                ...(note.color ? { color: note.color } : {}),
+            })),
+        }
+
+        const jsonString = JSON.stringify(exportData, null, 2)
+        const encoder = new TextEncoder()
+        const data = encoder.encode(jsonString)
+        this.downloadFile(data, filename, 'application/json')
+    }
+
+    /**
+     * Helper to download a file
+     */
+    private downloadFile(data: Uint8Array | ArrayBuffer, filename: string, mimeType: string): void {
+        // Create blob from data (use type assertion for strict TypeScript compatibility)
+        const blob = new Blob([data as BlobPart], { type: mimeType })
+        const url = URL.createObjectURL(blob)
+        const link = document.createElement('a')
+        link.href = url
+        link.download = filename
+        document.body.appendChild(link)
+        link.click()
+        document.body.removeChild(link)
+        URL.revokeObjectURL(url)
     }
 
     // ==================== Lifecycle ====================
@@ -1386,7 +2494,24 @@ export default class PianoRollPlugin extends BasePlugin<PianoRollPluginEvents, P
         if (this.container) {
             this.container.removeEventListener('mousemove', this.onMouseMove)
             this.container.removeEventListener('mouseleave', this.onMouseLeave)
+            this.container.removeEventListener('mousedown', this.onMouseDown)
+            this.container.removeEventListener('dblclick', this.onDoubleClick)
         }
+
+        // Clean up any active drag state
+        if (this.dragState) {
+            document.removeEventListener('mousemove', this.onDragMove)
+            document.removeEventListener('mouseup', this.onDragEnd)
+            this.dragState = null
+        }
+
+        // Clean up any active selection state
+        if (this.selectionBox) {
+            document.removeEventListener('mousemove', this.onSelectionDrag)
+            document.removeEventListener('mouseup', this.onSelectionEnd)
+            this.selectionBox = null
+        }
+        this.selectedNotes.clear()
 
         // Unsubscribe from wavesurfer events
         this.subscriptions.forEach((unsubscribe) => unsubscribe())
