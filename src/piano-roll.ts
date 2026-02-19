@@ -399,38 +399,40 @@ export default class PianoRollPlugin extends BasePlugin<PianoRollPluginEvents, P
 
         wavesurferWrapper.appendChild(this.container)
 
-        // Append controls to userContainer (outermost fixed container)
-        // WaveSurfer structure: userContainer > scrollContainer > wrapper
-        // userContainer doesn't scroll, so absolute positioning works correctly
+        // Append controls to the user container in the regular DOM.
+        // WaveSurfer v7 uses Shadow DOM: getWrapper() returns .wrapper inside the shadow root.
+        // parentElement traversal stops at the shadow root boundary (returns null there),
+        // so we escape via getRootNode().host to reach the actual user-provided container.
         if (this.controlsContainer) {
-            const scrollContainer = wavesurferWrapper.parentElement
-            const userContainer = scrollContainer?.parentElement
+            const rootNode = wavesurferWrapper.getRootNode()
+            const shadowHost = rootNode instanceof ShadowRoot ? (rootNode.host as HTMLElement) : null
+            const userContainer = shadowHost?.parentElement as HTMLElement | null
+
+            const applyControlsStyles = (parent: HTMLElement) => {
+                parent.style.position = 'relative'
+                this.controlsContainer!.style.position = 'absolute'
+                this.controlsContainer!.style.top = '4px'
+                this.controlsContainer!.style.right = '4px'
+                this.controlsContainer!.style.zIndex = '100'
+                parent.appendChild(this.controlsContainer!)
+            }
 
             if (userContainer) {
-                userContainer.style.position = 'relative'
-
-                // Position controls absolutely within the userContainer
-                this.controlsContainer.style.position = 'absolute'
-                this.controlsContainer.style.top = '4px'
-                this.controlsContainer.style.right = '4px'
-                this.controlsContainer.style.zIndex = '100'
-
-                userContainer.appendChild(this.controlsContainer)
-            } else if (scrollContainer) {
-                // Fallback to scrollContainer
-                scrollContainer.style.position = 'relative'
-                this.controlsContainer.style.position = 'absolute'
-                this.controlsContainer.style.top = '4px'
-                this.controlsContainer.style.right = '4px'
-                this.controlsContainer.style.zIndex = '100'
-                scrollContainer.appendChild(this.controlsContainer)
+                // Best case: attach to the user-provided wavesurfer container (regular DOM).
+                // This element's width is governed by page layout and never grows with zoom,
+                // so right: 4px stays pinned to the visible right edge.
+                applyControlsStyles(userContainer)
+            } else if (shadowHost) {
+                // Fallback: attach to shadow host div (still in regular DOM, fixed width)
+                applyControlsStyles(shadowHost)
             } else {
-                // Final fallback: append to container
-                this.controlsContainer.style.position = 'absolute'
-                this.controlsContainer.style.top = '4px'
-                this.controlsContainer.style.right = '4px'
-                this.controlsContainer.style.zIndex = '100'
-                this.container.appendChild(this.controlsContainer)
+                // Final fallback: attach to .scroll inside shadow DOM
+                const scrollContainer = wavesurferWrapper.parentElement
+                if (scrollContainer) {
+                    applyControlsStyles(scrollContainer as HTMLElement)
+                } else {
+                    applyControlsStyles(this.container)
+                }
             }
         }
 
