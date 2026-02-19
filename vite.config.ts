@@ -14,6 +14,15 @@ export default {
             name: 'pianoRollPlugin',
             fileName: (format) => `piano-roll-plugin.${format}.js`
         },
-
+        rollupOptions: {
+            external: [/^wavesurfer\.js/],
+            output: {
+                exports: 'named',
+                globals: {
+                    'wavesurfer.js': 'WaveSurfer',
+                    'wavesurfer.js/dist/base-plugin.js': 'WaveSurfer.BasePlugin',
+                },
+            },
+        },
     }
 } satisfies UserConfig

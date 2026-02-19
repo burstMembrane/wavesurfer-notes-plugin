@@ -7,14 +7,17 @@
   ],
   "main": "./dist/piano-roll-plugin.umd.js",
   "module": "./dist/piano-roll-plugin.es.js",
+  "types": "./dist/piano-roll-plugin.es.d.ts",
   "exports": {
     ".": {
+      "types": "./dist/piano-roll-plugin.es.d.ts",
       "import": "./dist/piano-roll-plugin.es.js",
       "require": "./dist/piano-roll-plugin.umd.js"
     }
   },
   "scripts": {
     "dev": "vite --config vite.dev.config.ts",
+    "dev:dist": "vite --config vite.dist-test.config.ts",
     "build": "tsc && vite build",
     "build-example": "vite build --config vite.dev.config.ts",
     "preview": "vite preview",
@@ -27,8 +30,7 @@
   },
   "dependencies": {
     "@tonejs/midi": "^2.0.28",
-    "tone": "^15.1.22",
-    "wavesurfer.js": "^7.0.0"
+    "tone": "^15.1.22"
   },
   "peerDependencies": {
     "wavesurfer.js": "^7.0.0"
